@@ -8,6 +8,7 @@ import {
     FileSystemWatcher,
     FileType,
     Progress,
+    RelativePattern,
     Uri,
     WorkspaceFolder,
     window,
@@ -104,10 +105,6 @@ export class RulesetResolver implements Disposable {
         }
         logger.debug('using pattern', this.yamlPattern);
 
-        // workspace.onDidCloseTextDocument((e) => {
-        //     logger.debug(`[${(new Date()).toISOString()}] closing textDocument (remaining: ${workspace.textDocuments.length}) ${e.fileName}`);
-        // });
-
         rulesetTree.init();
     }
 
@@ -128,7 +125,6 @@ export class RulesetResolver implements Disposable {
     private ruleSheetReloaded(_progress: Progress<{ message?: string; increment?: number }>): void {
         // wait until we are not processing files anymore
         if (Object.keys(this.processingFiles).length > 0 || Object.keys(this.deletingFiles).length > 0) {
-            // logger.debug(`still processing ${Object.keys(this.processingFiles).length} files (deleted: ${Object.keys(this.deletingFiles).length}), open: ${workspace.textDocuments.length}`);
             return;
         }
 
@@ -144,11 +140,12 @@ export class RulesetResolver implements Disposable {
 
         return Promise.all(
             workspace.workspaceFolders.map(async (workspaceFolder) => {
-                logger.debug('loading yaml files for workspace dir:', workspaceFolder.name);
+                const modRoot = this.getModRootUri(workspaceFolder);
+                logger.debug('loading yaml files for mod root:', modRoot.fsPath);
                 const files = await this.getYamlFilesForWorkspaceFolder(workspaceFolder);
                 return Promise.all(
                     files.map((file) => {
-                        logger.debug(`loading ruleset file: ${this.getCleanFile(file, workspaceFolder.uri)}`);
+                        logger.debug(`loading ruleset file: ${this.getCleanFile(file, modRoot)}`);
                         return this.loadYamlIntoTree(file, workspaceFolder, files.length);
                     }),
                 );
@@ -158,21 +155,27 @@ export class RulesetResolver implements Disposable {
 
     private async getYamlFilesForWorkspaceFolder(workspaceFolder: WorkspaceFolder): Promise<Uri[]> {
         let files: Uri[] = [];
+        const modRoot = this.getModRootUri(workspaceFolder);
+        if (!existsSync(modRoot.fsPath)) {
+            window.showErrorMessage(
+                `Cannot find configured OpenXcom mod root '${workspace.asRelativePath(modRoot)}' for workspace '${workspaceFolder.name}'`,
+            );
+            return files;
+        }
+
         await Promise.all([
-            await workspace.findFiles(this.yamlPattern),
-            await workspace.findFiles('**/Language/*.yml'),
+            await workspace.findFiles(new RelativePattern(modRoot.fsPath, this.yamlPattern)),
+            await workspace.findFiles(new RelativePattern(modRoot.fsPath, '**/Language/*.yml')),
         ]).then((values) => {
-            files = files
-                .concat(...values)
-                .filter((file) => workspace.getWorkspaceFolder(file)?.uri.path === workspaceFolder.uri.path);
+            files = files.concat(...values);
         });
 
         await this.getAssetRulesets(files);
 
         // load parent mods into the mix
-        files = await this.findParentMods(workspaceFolder, files);
+        files = await this.findParentMods(workspaceFolder, modRoot, files);
 
-        this.rulesetHierarchy.mod = workspaceFolder.uri;
+        this.rulesetHierarchy.mod = modRoot;
 
         logger.debug(`Hierarchy: ${JSON.stringify(this.rulesetHierarchy)}`);
 
@@ -184,9 +187,7 @@ export class RulesetResolver implements Disposable {
         }
 
         if (files.length === 0) {
-            logger.warn(
-                `no ruleset files in project dir found, ${workspaceFolder.uri.path} is probably not an OXC(E) project.`,
-            );
+            logger.warn(`no ruleset files in mod root found, ${modRoot.path} is probably not an OXC(E) project.`);
             return files;
         }
 
@@ -196,22 +197,21 @@ export class RulesetResolver implements Disposable {
     /**
      * Loads any parent mods if specified in the settings
      * @param workspaceFolder
+     * @param modRoot
      * @param files
      * @returns
      */
-    private async findParentMods(workspaceFolder: WorkspaceFolder, files: Uri[]) {
-        const parentMods = workspace.getConfiguration('oxcYamlHelper').get<string[]>('parentMods') || [];
+    private async findParentMods(workspaceFolder: WorkspaceFolder, modRoot: Uri, files: Uri[]) {
+        const parentMods = workspace.getConfiguration('oxcYamlHelper', workspaceFolder.uri).get<string[]>('parentMods') || [];
         if (parentMods.length) {
             const missingMods = [];
             for (const parentMod of parentMods) {
-                if (existsSync(Uri.joinPath(workspaceFolder.uri, `../${parentMod}`).fsPath)) {
+                const parentModUri = Uri.joinPath(modRoot, `../${parentMod}`);
+                if (existsSync(parentModUri.fsPath)) {
                     logger.debug(`Adding in parent mod ${parentMod}`);
-                    this.rulesetHierarchy[`parent${parentMod}`] = Uri.joinPath(workspaceFolder.uri, `../${parentMod}`);
+                    this.rulesetHierarchy[`parent${parentMod}`] = parentModUri;
 
-                    const foundFiles = await glob(
-                        Uri.joinPath(this.rulesetHierarchy[`parent${parentMod}`], '**/*.rul').fsPath,
-                        {},
-                    );
+                    const foundFiles = await glob(Uri.joinPath(parentModUri, '**/*.rul').fsPath, {});
                     files = files.concat(...foundFiles.map((path) => Uri.file(path)));
                 } else {
                     missingMods.push(parentMod);
@@ -228,6 +228,9 @@ export class RulesetResolver implements Disposable {
 
     private async getAssetRulesets(files: Uri[]) {
         const assetPath = this.getAssetUri();
+        if (!assetPath) {
+            return;
+        }
         this.rulesetHierarchy.vanilla = assetPath;
 
         if (this.context) {
@@ -258,7 +261,16 @@ export class RulesetResolver implements Disposable {
         if (this.fileSystemWatcher) {
             this.fileSystemWatcher.dispose();
         }
-        this.fileSystemWatcher = workspace.createFileSystemWatcher('**/{' + this.yamlPattern + ',Language/*.yml}');
+
+        if (workspace.workspaceFolders?.length === 1) {
+            const modRoot = this.getModRootUri(workspace.workspaceFolders[0]);
+            this.fileSystemWatcher = workspace.createFileSystemWatcher(
+                new RelativePattern(modRoot.fsPath, `{${this.yamlPattern},**/Language/*.yml}`),
+            );
+        } else {
+            this.fileSystemWatcher = workspace.createFileSystemWatcher('**/{' + this.yamlPattern + ',Language/*.yml}');
+        }
+
         this.fileSystemWatcher.onDidDelete((e: Uri) => {
             logger.debug(`file deleted ${e.path}`);
             this.deletingFiles[e.path] = true;
@@ -281,31 +293,23 @@ export class RulesetResolver implements Disposable {
                 this.processingFiles[e.path] = true;
             }
 
-            // const folder = workspace.getWorkspaceFolder(Uri.file(e.path));
-            // if (folder) {
-            //     rulesetTree.getDiagnosticCollection(folder)?.clear();
-            // }
-
             logger.debug(
                 `reloading ruleset file: ${e.path} (processing: ${
                     Object.keys(this.processingFiles).length
                 }) (deleted: ${Object.keys(this.deletingFiles).length})`,
             );
             if (isSavedFile || !workspace.textDocuments.find((wsFile) => wsFile.fileName === e.fsPath)) {
-                // logger.debug(`textdocument not open for file ${e.path}, loading`);
                 this.loadYamlIntoTree(e);
             }
         });
 
         workspace.onDidSaveTextDocument((e) => {
-            // logger.debug(`textdoc saved: ${e.uri.path}`);
             this.savedFiles[e.uri.path] = true;
         });
 
         workspace.onDidChangeTextDocument((e) => {
             // wait for the textdocument to change, before parsing again
             if (!(e.document.uri.path in this.processingFiles)) {
-                // logger.debug(`NOT! in list ${e.document.uri.path}`);
                 return;
             }
 
@@ -323,7 +327,6 @@ export class RulesetResolver implements Disposable {
         rulesetTree.deleteFileFromTree(workspaceFolder, file);
 
         // trigger a reload (should maybe have its own event)?
-        //        logger.debug(`deleted ${path}`);
         delete this.deletingFiles[file.path];
         this.onDidLoadEmitter.emit('didLoadRulesheet');
     }
@@ -377,10 +380,11 @@ export class RulesetResolver implements Disposable {
 
         rulesetTree.mergeTranslationsIntoTree(parsed.translations, workspaceFolder, file);
 
+        const modRoot = this.getModRootUri(workspaceFolder);
         delete this.processingFiles[file.path];
         this.onDidLoadEmitter.emit(
             'didLoadRulesheet',
-            file.path.slice(workspaceFolder.uri.path.length + 1),
+            this.getCleanFile(file, modRoot),
             rulesetTree.getNumberOfParsedDefinitionFiles(workspaceFolder),
             numberOfFiles,
         );
@@ -396,6 +400,7 @@ export class RulesetResolver implements Disposable {
         }
 
         try {
+            const modRoot = this.getModRootUri(workspaceFolder);
             let translations: Translation[] = [];
             let parsed: ParsedRuleset;
             if (this.isLanguageFile(file)) {
@@ -425,24 +430,16 @@ export class RulesetResolver implements Disposable {
 
                 const doc = rulesetParser.parseDocument(text);
 
-                // console.log(file.path);
                 const [references, logicData] = rulesetParser.getReferencesRecursively(doc.parsed);
 
                 rulesetParser.addRangePositions(references, document);
                 rulesetParser.addRangePositions(logicData, document);
+                logger.debug(`found ${references?.length} references in file ${this.getCleanFile(file, modRoot)}`);
                 logger.debug(
-                    `found ${references?.length} references in file ${this.getCleanFile(file, workspaceFolder.uri)}`,
-                );
-                logger.debug(
-                    `found ${logicData?.length} logic data entries in file ${this.getCleanFile(
-                        file,
-                        workspaceFolder.uri,
-                    )}`,
+                    `found ${logicData?.length} logic data entries in file ${this.getCleanFile(file, modRoot)}`,
                 );
                 const definitions = rulesetParser.getDefinitionsFromReferences(references);
-                logger.debug(
-                    `found ${definitions.length} definitions in file ${this.getCleanFile(file, workspaceFolder.uri)}`,
-                );
+                logger.debug(`found ${definitions.length} definitions in file ${this.getCleanFile(file, modRoot)}`);
 
                 // can't use references (yet), variables and extraStrings are not references (yet) (they are keys, not values)
                 const variables = rulesetParser.getVariables(references);
@@ -497,7 +494,6 @@ export class RulesetResolver implements Disposable {
         const folder = workspace.getWorkspaceFolder(sourceUri);
         if (!folder) {
             // file is most likely not in the workspace folder (probably an asset), so ignore it
-            // logger.debug(`getTranslationForKey: ${sourceUri.path} is not in the workspace`);
             throw new FileNotInWorkspaceError();
         }
 
@@ -533,7 +529,7 @@ export class RulesetResolver implements Disposable {
         }
 
         workspace.workspaceFolders.map((workspaceFolder) => {
-            rulesetTree.checkDefinitions(workspaceFolder, this.getAssetUri());
+            rulesetTree.checkDefinitions(workspaceFolder, this.getAssetUri() ?? Uri.file('__NO_OXC_ASSETS__'));
         });
 
         this.checkForCommonProblems();
@@ -544,9 +540,7 @@ export class RulesetResolver implements Disposable {
     private checkForCommonProblems() {
         const problemsByPath = rulesetDefinitionChecker.getProblemsByPath();
         const itemsCategories = problemsByPath['items.categories'] || 0;
-        // const manufactureCategory = problemsByPath['manufacture.category'] || 0;
 
-        // if (itemsCategories + manufactureCategory > 25) {
         if (itemsCategories > 25) {
             this.proposeDisableCategories();
         }
@@ -571,8 +565,6 @@ export class RulesetResolver implements Disposable {
                 workspace
                     .getConfiguration('oxcYamlHelper')
                     .update('validateCategories', 'no', ConfigurationTarget.Workspace);
-                // } else if (result === choices.notNow) {
-                //     console.log(result);
             } else if (result === choices.always) {
                 workspace
                     .getConfiguration('oxcYamlHelper')
@@ -581,12 +573,16 @@ export class RulesetResolver implements Disposable {
         });
     }
 
-    private getAssetUri() {
+    private getAssetUri(): Uri | undefined {
         if (!this.context) {
             throw new Error("Couldn't get extension context");
         }
 
-        const baseGame = workspace.getConfiguration('oxcYamlHelper').get('baseGame');
+        const baseGame = workspace.getConfiguration('oxcYamlHelper').get<string>('baseGame');
+        if (baseGame === 'none') {
+            return;
+        }
+
         const game = `xcom1${baseGame === 'oxce' ? '-oxce' : ''}`;
 
         let path = `out/assets/${game}`;
@@ -597,6 +593,27 @@ export class RulesetResolver implements Disposable {
         return Uri.joinPath(this.context.extensionUri, '/' + path);
     }
 
+    private getModRootUri(workspaceFolder: WorkspaceFolder): Uri {
+        const configuredModRoot = workspace
+            .getConfiguration('oxcYamlHelper', workspaceFolder.uri)
+            .get<string>('modRoot')
+            ?.trim();
+        if (!configuredModRoot || configuredModRoot === '.') {
+            return workspaceFolder.uri;
+        }
+
+        const pathParts = configuredModRoot
+            .replace(/\\/g, '/')
+            .split('/')
+            .filter((pathPart) => pathPart.length > 0 && pathPart !== '.');
+
+        if (pathParts.length === 0) {
+            return workspaceFolder.uri;
+        }
+
+        return Uri.joinPath(workspaceFolder.uri, ...pathParts);
+    }
+
     public getRulesetHierarchy() {
         return this.rulesetHierarchy;
     }
@@ -604,10 +621,12 @@ export class RulesetResolver implements Disposable {
     public getCleanFile(file: Uri, workspaceFolder: Uri) {
         const assetPath = this.getAssetUri();
         let fileClean = '';
-        if (file.path.startsWith(assetPath.path)) {
+        if (assetPath && file.path.startsWith(assetPath.path)) {
             fileClean = `<ASSETS>/${file.path.slice(assetPath.path.length + 1)}`;
-        } else {
+        } else if (file.path.startsWith(Uri.joinPath(workspaceFolder, '/').path)) {
             fileClean = file.path.slice(workspaceFolder.path.length + 1);
+        } else {
+            fileClean = file.fsPath;
         }
 
         return fileClean;

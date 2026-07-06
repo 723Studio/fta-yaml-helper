@@ -21,13 +21,35 @@ type LinkerConfig = {
 let config: LinkerConfig;
 let errorShown = false;
 
+const getConfiguredModRoot = (workspaceFolderUri: Uri) => {
+    const configuredModRoot = workspace
+        .getConfiguration('oxcYamlHelper', workspaceFolderUri)
+        .get<string>('modRoot')
+        ?.trim();
+    if (!configuredModRoot || configuredModRoot === '.') {
+        return workspaceFolderUri;
+    }
+
+    const pathParts = configuredModRoot
+        .replace(/\\/g, '/')
+        .split('/')
+        .filter((pathPart) => pathPart.length > 0 && pathPart !== '.');
+
+    if (pathParts.length === 0) {
+        return workspaceFolderUri;
+    }
+
+    return Uri.joinPath(workspaceFolderUri, ...pathParts);
+};
+
 const getLinkerConfig = () => {
     if (config) {
         return config;
     }
 
     if (workspace?.workspaceFolders) {
-        const path = Uri.joinPath(workspace.workspaceFolders[0].uri, 'linker.yml');
+        const workspaceFolderUri = workspace.workspaceFolders[0].uri;
+        const path = Uri.joinPath(getConfiguredModRoot(workspaceFolderUri), 'linker.yml');
         if (existsSync(path.fsPath)) {
             const configFile = readFileSync(path.fsPath);
 
@@ -103,7 +125,11 @@ export const getAdditionalGlobalVariablePaths = () => {
     return getLinkerConfig()?.globalVariables ?? [];
 };
 
-export const pathStartsWith = (file1: Uri, file2: Uri) => {
+export const pathStartsWith = (file1: Uri, file2: Uri | undefined) => {
+    if (!file2) {
+        return false;
+    }
+
     // handle case insensitivity in windows -- on github actions, for some reason the mod path was /D:/ and the def path was /d:/
     let file1path = file1.path;
     let file2path = Uri.joinPath(file2, '/').path;
