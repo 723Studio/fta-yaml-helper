@@ -16,6 +16,28 @@ Welcome to the OpenXcom (Extended) Ruleset Linker. This extension aims to turn V
 ## How to install VScode and this extension
 Please see [this walkthrough guide](https://github.com/pedroterzero/oxce-yaml-helper/blob/main/INSTALL.md)!
 
+## Monorepos and nested mod roots
+By default, the extension treats each VS Code workspace folder as the OpenXcom mod root. If your ruleset is inside a larger repository, configure `oxcYamlHelper.modRoot` with the path from the workspace folder to the actual mod root.
+
+For example, if your repository contains a mod under `content/From the Ashes`, use:
+
+```json
+{
+    "oxcYamlHelper.modRoot": "content/From the Ashes",
+    "oxcYamlHelper.ruleFilesPattern": "Ruleset/**/*.rul"
+}
+```
+
+Standalone projects that should not inherit the bundled X-COM rulesets can also disable builtin base game loading:
+
+```json
+{
+    "oxcYamlHelper.baseGame": "none"
+}
+```
+
+Leaving `modRoot` empty and `baseGame` set to `oxce` keeps the previous behavior.
+
 ## How to use it
 
 ### Definitions
